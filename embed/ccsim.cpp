@@ -59,10 +59,13 @@ namespace {
 struct Vec3 { double x, y, z; };
 std::map<int, Vec3> g_pos;
 std::mutex g_pos_mutex;
-std::atomic<bool> g_inited{false};
+std::once_flag g_init_once;
 
 void ensure_init(const std::string& rom, const std::string& base) {
-    if (g_inited.exchange(true)) return;
+    // call_once blocks every caller until the first finishes initializing, so
+    // a concurrent second session can't spawn computers before the emulator,
+    // task pump and distance provider are ready.
+    std::call_once(g_init_once, [&]() {
     fs::path basep = base;
     fs::remove_all(basep);
     fs::create_directories(basep);
@@ -86,6 +89,7 @@ void ensure_init(const std::string& rom, const std::string& base) {
         mainThreadID = std::this_thread::get_id();
         while (true) { try { defaultPollEvents(); } catch (...) {} }
     }).detach();
+    });
 }
 
 void spawn(int id, Vec3 p, const std::string& startup) {
@@ -104,26 +108,39 @@ extern "C" {
 int cc_gps_selftest(const char* rom) {
     ensure_init(rom ? rom : "", "/tmp/ccsim-selftest");
 
-    auto hostStartup = [](int x, int y, int z) {
+    // Per-call id base AND modem netID so calls/sessions are isolated: each
+    // call's computers form their own rednet (modem::transmit only delivers
+    // within network[netID]), so concurrent sessions never cross-talk.
+    static std::atomic<int> seq{0};
+    int n = seq.fetch_add(1);
+    int b = n * 10;     // unique computer-id block
+    int net = n + 1;    // unique modem network (0 is the default shared net)
+
+    auto hostStartup = [net](int x, int y, int z) {
         char buf[256];
         snprintf(buf, sizeof(buf),
-            "periphemu.create('top','modem')\nshell.run('gps','host',%d,%d,%d)\n", x, y, z);
+            "periphemu.create('top','modem',%d,true)\nshell.run('gps','host',%d,%d,%d)\n",
+            net, x, y, z);
         return std::string(buf);
     };
-    spawn(0, {0, 0, 0}, hostStartup(0, 0, 0));
-    spawn(1, {10, 0, 0}, hostStartup(10, 0, 0));
-    spawn(2, {0, 10, 0}, hostStartup(0, 10, 0));
-    spawn(3, {0, 0, 10}, hostStartup(0, 0, 10));
-    spawn(4, {3, 4, 5},
-        "periphemu.create('top','modem')\n"
-        "sleep(2)\n"
-        "local x,y,z = gps.locate(8)\n"
-        "local f = fs.open('/result.txt','w')\n"
-        "if x then f.write(math.floor(x+0.5)..','..math.floor(y+0.5)..','..math.floor(z+0.5))\n"
-        "else f.write('nil') end\n"
-        "f.close()\n");
+    spawn(b + 0, {0, 0, 0}, hostStartup(0, 0, 0));
+    spawn(b + 1, {10, 0, 0}, hostStartup(10, 0, 0));
+    spawn(b + 2, {0, 10, 0}, hostStartup(0, 10, 0));
+    spawn(b + 3, {0, 0, 10}, hostStartup(0, 0, 10));
+    {
+        char buf[512];
+        snprintf(buf, sizeof(buf),
+            "periphemu.create('top','modem',%d,true)\n"
+            "sleep(2)\n"
+            "local x,y,z = gps.locate(8)\n"
+            "local f = fs.open('/result.txt','w')\n"
+            "if x then f.write(math.floor(x+0.5)..','..math.floor(y+0.5)..','..math.floor(z+0.5))\n"
+            "else f.write('nil') end\n"
+            "f.close()\n", net);
+        spawn(b + 4, {3, 4, 5}, buf);
+    }
 
-    fs::path res = computerDir / "4" / "result.txt";
+    fs::path res = computerDir / std::to_string(b + 4) / "result.txt";
     for (int i = 0; i < 200; i++) {                  // up to 20s
         if (fs::exists(res)) {
             std::ifstream in(res); std::string out; std::getline(in, out);

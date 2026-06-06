@@ -1,17 +1,35 @@
 //! craftos-mcp — an MCP server that drives an embedded CraftOS-PC to run
 //! declarative, simulated multi-computer CC tests (rednet / GPS / ...).
 //!
-//! Transports: stdio (default), streamable-http, and legacy SSE — selected with
-//! `--transport`. The embedded emulator writes noise to the process stdout, so
-//! for stdio we hand rmcp the *real* stdout and redirect the emulator's fd 1 to
-//! a log file, keeping the JSON-RPC channel clean.
+//! Transports (select with `--transport`, default stdio):
+//!   stdio            line-delimited JSON-RPC on stdin/stdout
+//!   streamable-http  rmcp StreamableHttpService at  http://0.0.0.0:<port>/mcp
+//!   sse              legacy HTTP+SSE: GET /sse (stream) + POST /message
+//!
+//! The embedded emulator writes noise to fd 1, so we redirect it to a log file
+//! at startup; for stdio we keep the *real* stdout for rmcp's JSON-RPC channel.
 
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::os::raw::c_char;
-use std::os::unix::io::FromRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+use axum::extract::{Query, State};
+use axum::http::StatusCode;
+use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::routing::{get, post};
+use axum::Router;
+use futures::StreamExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::model::{ServerCapabilities, ServerInfo};
+use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
 
 extern "C" {
@@ -24,6 +42,7 @@ fn rom_path() -> String {
     })
 }
 
+// ── MCP handler (shared by every transport) ──────────────────────────────────
 #[derive(Clone)]
 struct CraftosMcp {
     tool_router: ToolRouter<Self>,
@@ -39,7 +58,7 @@ impl CraftosMcp {
         description = "Run the embedded multi-computer GPS self-test: boot 4 \
         wireless GPS hosts at known coordinates plus a client, and verify \
         gps.locate() trilaterates the client's true position (3,4,5). Returns \
-        JSON {pass, expected, actual}."
+        JSON {pass, expected, detail}."
     )]
     async fn gps_selftest(&self) -> String {
         let rom = rom_path();
@@ -72,10 +91,10 @@ impl ServerHandler for CraftosMcp {
     }
 }
 
+// ── stdout handling ──────────────────────────────────────────────────────────
 /// Redirect the emulator's stdout (fd 1) to a log file, returning a tokio handle
-/// to the *original* stdout for rmcp's JSON-RPC channel.
-fn detach_stdout(log: &str) -> tokio::fs::File {
-    use std::os::unix::io::AsRawFd;
+/// to the *original* stdout (used by the stdio transport for JSON-RPC).
+fn redirect_emulator_stdout(log: &str) -> tokio::fs::File {
     let real = unsafe { libc::dup(1) };
     let logfile = std::fs::OpenOptions::new()
         .create(true)
@@ -89,25 +108,120 @@ fn detach_stdout(log: &str) -> tokio::fs::File {
     tokio::fs::File::from_std(real_std)
 }
 
+// ── legacy SSE shim (GET /sse + POST /message) ───────────────────────────────
+type Sessions = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<String>>>>;
+static SESSION_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// GET /sse — open an SSE stream, bridging a fresh MCP service over an in-memory
+/// duplex. First event is `endpoint` (the POST URL); subsequent events are
+/// `message` carrying JSON-RPC responses.
+async fn sse_get(State(sessions): State<Sessions>) -> Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let id = format!("s{}", SESSION_SEQ.fetch_add(1, Ordering::Relaxed));
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+
+    // Serve the MCP handler over the server side of the duplex.
+    let (sr, sw) = tokio::io::split(server_io);
+    tokio::spawn(async move {
+        if let Ok(svc) = CraftosMcp::new().serve((sr, sw)).await {
+            let _ = svc.waiting().await;
+        }
+    });
+
+    let (cr, mut cw) = tokio::io::split(client_io);
+
+    // inbound: POST bodies -> write newline-delimited into the service.
+    let (in_tx, mut in_rx) = mpsc::unbounded_channel::<String>();
+    sessions.lock().unwrap().insert(id.clone(), in_tx);
+    tokio::spawn(async move {
+        while let Some(msg) = in_rx.recv().await {
+            if cw.write_all(msg.as_bytes()).await.is_err() { break; }
+            let _ = cw.write_all(b"\n").await;
+            let _ = cw.flush().await;
+        }
+    });
+
+    // outbound: service's responses (lines) -> SSE `message` events.
+    let (out_tx, out_rx) = mpsc::unbounded_channel::<String>();
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(cr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if out_tx.send(line).is_err() { break; }
+        }
+    });
+
+    let endpoint = format!("/message?sessionId={id}");
+    let first = futures::stream::once(async move {
+        Ok(Event::default().event("endpoint").data(endpoint))
+    });
+    let rest = UnboundedReceiverStream::new(out_rx)
+        .map(|line| Ok(Event::default().event("message").data(line)));
+    Sse::new(first.chain(rest)).keep_alive(KeepAlive::default())
+}
+
+/// POST /message?sessionId=... — feed a JSON-RPC request into the SSE session.
+async fn sse_post(
+    State(sessions): State<Sessions>,
+    Query(q): Query<HashMap<String, String>>,
+    body: String,
+) -> StatusCode {
+    if let Some(id) = q.get("sessionId") {
+        if let Some(tx) = sessions.lock().unwrap().get(id) {
+            if tx.send(body).is_ok() {
+                return StatusCode::ACCEPTED;
+            }
+        }
+    }
+    StatusCode::NOT_FOUND
+}
+
+// ── entrypoint ───────────────────────────────────────────────────────────────
+fn arg(name: &str) -> Option<String> {
+    std::env::args().skip_while(|a| a != name).nth(1)
+}
+
+/// Build the combined HTTP app exposing BOTH transports concurrently:
+///   POST/GET /mcp           streamable-HTTP (MCP 2025-03-26+)
+///   GET /sse + POST /message  legacy HTTP+SSE
+///   GET /health             liveness for Railway
+fn http_app() -> Router {
+    let mcp = StreamableHttpService::new(
+        || Ok(CraftosMcp::new()),
+        Arc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default(),
+    );
+    let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
+    Router::new()
+        .route("/sse", get(sse_get))
+        .route("/message", post(sse_post))
+        .with_state(sessions)
+        .nest_service("/mcp", mcp)
+        .route("/health", get(|| async { "ok" }))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let transport = std::env::args()
-        .skip_while(|a| a != "--transport")
-        .nth(1)
-        .unwrap_or_else(|| "stdio".into());
+    let real_stdout = redirect_emulator_stdout("/tmp/craftos-mcp.log");
+    let transport = arg("--transport").unwrap_or_else(|| "stdio".into());
+    // Railway provides $PORT; --port overrides; default 8000.
+    let port: u16 = arg("--port")
+        .or_else(|| std::env::var("PORT").ok())
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(8000);
 
     match transport.as_str() {
         "stdio" => {
-            // rmcp speaks JSON-RPC on the real stdout; emulator noise -> log.
-            let out = detach_stdout("/tmp/craftos-mcp.log");
-            let service = CraftosMcp::new()
-                .serve((tokio::io::stdin(), out))
-                .await?;
+            let service = CraftosMcp::new().serve((tokio::io::stdin(), real_stdout)).await?;
             service.waiting().await?;
         }
-        other => {
-            anyhow::bail!("transport '{other}' not wired yet (stdio works; http/sse next)");
+        // One HTTP server exposing /mcp and /sse concurrently (Railway default).
+        "http" | "all" | "streamable-http" | "sse" => {
+            let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
+            eprintln!(
+                "craftos-mcp on http://0.0.0.0:{port}  (streamable-HTTP: /mcp, legacy SSE: /sse + /message)"
+            );
+            axum::serve(listener, http_app()).await?;
         }
+        other => anyhow::bail!("unknown --transport '{other}' (stdio|http)"),
     }
     Ok(())
 }
