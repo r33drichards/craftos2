@@ -53,3 +53,6 @@ vcpkg_installed
 /embed/*.o
 /embed/gps_test
 /result/
+
+# rust build
+/mcp/target/
