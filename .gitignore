@@ -45,3 +45,5 @@ vcpkg_installed
 *.dylib
 *.so
 *.bundle
+# turtle-sim local runtime data
+/.craftos-data/
