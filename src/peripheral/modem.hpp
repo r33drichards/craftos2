@@ -25,6 +25,10 @@ private:
     std::unordered_set<int> idsToDelete;
     std::string side;
     int netID = 0;
+    // CraftOS-PC has no native wireless modems (isWireless was hardcoded false),
+    // which makes GPS impossible. For this fork's rednet/GPS testing we default
+    // modems to wireless; pass `false` as the 4th periphemu.create arg for wired.
+    bool wireless = true;
     int isOpen(lua_State *L);
     int open(lua_State *L);
     int close(lua_State *L);

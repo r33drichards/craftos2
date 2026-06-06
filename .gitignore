@@ -47,3 +47,9 @@ vcpkg_installed
 *.bundle
 # turtle-sim local runtime data
 /.craftos-data/
+
+# embedded build artifacts
+/embed/libcraftos2.a
+/embed/*.o
+/embed/gps_test
+/result/
