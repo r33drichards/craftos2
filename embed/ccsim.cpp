@@ -20,8 +20,17 @@
 #include <cstdio>
 #include <cstdint>
 #include <map>
+#include <vector>
 #include <atomic>
 #include <mutex>
+#include <sstream>
+#include <cstring>
+#include <cstdlib>
+
+#include <Poco/JSON/Parser.h>
+#include <Poco/JSON/Object.h>
+#include <Poco/JSON/Array.h>
+#include <Poco/Dynamic/Var.h>
 
 #include <SDL2/SDL.h>
 #include <Computer.hpp>
@@ -99,9 +108,172 @@ void spawn(int id, Vec3 p, const std::string& startup) {
     std::ofstream(d / "startup.lua") << startup;
     startComputer(id);
 }
+
+std::string readFile(const fs::path& p) {
+    std::ifstream f(p, std::ios::binary);
+    if (!f) return "";
+    std::ostringstream ss; ss << f.rdbuf();
+    return ss.str();
+}
+
+// Locate sim/engine.lua (the Lua turtle fake-world engine) for turtle nodes.
+fs::path enginePath() {
+    if (const char* e = getenv("CRAFTOS_SIM_DIR")) {
+        fs::path p = fs::path(e) / "engine.lua";
+        if (fs::exists(p)) return p;
+    }
+    for (const char* c : {"/app/craftos2/sim/engine.lua", "sim/engine.lua"})
+        if (fs::exists(c)) return c;
+    return {};
+}
+
+// emit() helper + NET injected into every node; turtles also get the engine.
+std::string prelude(int net, bool turtle) {
+    std::ostringstream s;
+    s << "NET=" << net << "\n"
+         "local __o=''\n"
+         "function emit(...)\n"
+         "  local n=select('#',...) local t=''\n"
+         "  for i=1,n do t=t..tostring((select(i,...)))..(i<n and '\\t' or '') end\n"
+         "  __o=__o..t..'\\n'\n"
+         "  local f=fs.open('/out','w') f.write(__o) f.close()\n"
+         "end\n"
+         // setpos(x,y,z): move this node in the world (updates its wireless-modem\n"
+         // position, so other nodes' gps.locate tracks it as it travels).\n"
+         "function setpos(x,y,z)\n"
+         "  local f=fs.open('/pos','w') f.write(x..','..y..','..z) f.close()\n"
+         "end\n"
+         // done(): signal this node has finished, so the runtime returns its\n"
+         // full output promptly instead of waiting for the whole timeout.\n"
+         "function done()\n"
+         "  local f=fs.open('/done','w') f.write('1') f.close()\n"
+         "end\n";
+    if (turtle)
+        s << "do\n"
+             "  local engine=dofile('/engine.lua')\n"
+             "  local h=fs.open('/world.json','r') local wj=h and h.readAll() or '{}' if h then h.close() end\n"
+             "  engine.install(textutils.unserialiseJSON(wj) or {})\n"
+             "end\n";
+    return s.str();
+}
 } // namespace
 
 extern "C" {
+
+// Unified runtime: boot an arbitrary set of networked CC computers / turtles
+// from a JSON spec and return each node's emit() output as JSON.
+//
+// spec: {
+//   "rom": "<path>",                       // optional, else $CRAFTOS_ROM
+//   "timeout_ms": 15000,                   // optional
+//   "nodes": [
+//     { "label": "host1",
+//       "program": "...lua... (NET, emit() available; turtle if world set)",
+//       "position": [x,y,z],               // optional, modem distance / GPS
+//       "world": { ...engine world... },   // optional -> this node is a turtle
+//       "collect": true }                  // optional -> wait for its output
+//   ]
+// }
+// returns (caller frees with cc_free):
+//   { "net": N, "nodes": [ { "label", "id", "output", "turtle": bool } ] }
+char* cc_run(const char* spec_json) {
+    std::string rom;
+    Poco::JSON::Object::Ptr spec;
+    try {
+        Poco::JSON::Parser parser;
+        spec = parser.parse(std::string(spec_json ? spec_json : "{}"))
+                   .extract<Poco::JSON::Object::Ptr>();
+    } catch (...) {
+        return strdup("{\"error\":\"invalid JSON spec\"}");
+    }
+    rom = spec->optValue<std::string>("rom", getenv("CRAFTOS_ROM") ? getenv("CRAFTOS_ROM") : "");
+    ensure_init(rom, "/tmp/ccsim-run");
+
+    int timeout_ms = spec->optValue<int>("timeout_ms", 15000);
+    Poco::JSON::Array::Ptr nodes = spec->getArray("nodes");
+    if (!nodes) return strdup("{\"error\":\"spec.nodes must be an array\"}");
+
+    static std::atomic<int> seq{0};
+    int n = seq.fetch_add(1);
+    int base = n * 100;     // computer-id block (up to 100 nodes/run)
+    int net = n + 1;        // unique modem network for this run
+
+    std::string engineSrc;
+    struct NodeRec { int id; std::string label; bool collect; bool turtle; };
+    std::vector<NodeRec> recs;
+
+    for (size_t i = 0; i < nodes->size(); i++) {
+        Poco::JSON::Object::Ptr nd = nodes->getObject(i);
+        if (!nd) continue;
+        int id = base + (int)i + 1;
+        std::string label = nd->optValue<std::string>("label", "node" + std::to_string(i));
+        std::string program = nd->optValue<std::string>("program", "");
+        bool collect = nd->optValue<bool>("collect", false);
+        Vec3 pos{0, 0, 0};
+        if (nd->isArray("position")) {
+            auto a = nd->getArray("position");
+            if (a->size() >= 3) { pos.x = a->getElement<double>(0); pos.y = a->getElement<double>(1); pos.z = a->getElement<double>(2); }
+        }
+        bool turtle = nd->has("world") && !nd->isNull("world");
+
+        fs::path d = computerDir / std::to_string(id);
+        fs::create_directories(d);
+        if (turtle) {
+            if (engineSrc.empty()) engineSrc = readFile(enginePath());
+            std::ofstream(d / "engine.lua") << engineSrc;
+            std::ostringstream wj;
+            nd->getObject("world")->stringify(wj);
+            std::ofstream(d / "world.json") << wj.str();
+        }
+        spawn(id, pos, prelude(net, turtle) + "\n" + program + "\n");
+        recs.push_back({id, label, collect, turtle});
+    }
+
+    // Poll until all collect-nodes have produced output, or timeout.
+    int waited = 0;
+    auto allCollected = [&]() {
+        bool any = false;
+        for (auto& r : recs) if (r.collect) { any = true;
+            // ready when the node calls done() (or, if it never does, on timeout)
+            if (!fs::exists(computerDir / std::to_string(r.id) / "done")) return false; }
+        return any; // false if there are no collect-nodes -> poll to timeout
+    };
+    auto applyMoves = [&]() {
+        for (auto& r : recs) {
+            std::string p = readFile(computerDir / std::to_string(r.id) / "pos");
+            if (p.empty()) continue;
+            double x, y, z;
+            if (std::sscanf(p.c_str(), "%lf,%lf,%lf", &x, &y, &z) == 3) {
+                std::lock_guard<std::mutex> lk(g_pos_mutex);
+                g_pos[r.id] = {x, y, z};
+            }
+        }
+    };
+    while (waited < timeout_ms && !allCollected()) {
+        applyMoves();
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        waited += 100;
+    }
+    applyMoves();
+
+    Poco::JSON::Object res;
+    res.set("net", net);
+    Poco::JSON::Array arr;
+    for (auto& r : recs) {
+        Poco::JSON::Object o;
+        o.set("label", r.label);
+        o.set("id", r.id);
+        o.set("turtle", r.turtle);
+        o.set("output", readFile(computerDir / std::to_string(r.id) / "out"));
+        arr.add(o);
+    }
+    res.set("nodes", arr);
+    std::ostringstream os;
+    res.stringify(os);
+    return strdup(os.str().c_str());
+}
+
+void cc_free(char* p) { free(p); }
 
 // Run the canonical GPS scenario: 4 hosts + 1 client, verify trilateration.
 // Returns 1 on PASS, 0 on FAIL/timeout.

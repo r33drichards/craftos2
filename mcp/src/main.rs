@@ -27,13 +27,52 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use rmcp::handler::server::tool::ToolRouter;
+use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
+use schemars::JsonSchema;
+use serde::Deserialize;
 
 extern "C" {
     fn cc_gps_selftest(rom: *const c_char) -> i32;
+    fn cc_run(spec_json: *const c_char) -> *mut c_char;
+    fn cc_free(p: *mut c_char);
+}
+
+/// One computer (or turtle) in a simulation.
+#[derive(Deserialize, JsonSchema)]
+struct SimNode {
+    /// Label for this node in the results.
+    #[serde(default)]
+    label: Option<String>,
+    /// Arbitrary CC:Tweaked Lua to run on this node. The globals `NET` (this
+    /// run's wireless-modem network id) and `emit(...)` (record a result line)
+    /// are available. Create a wireless modem with
+    /// `periphemu.create('top','modem',NET,true)`.
+    program: String,
+    /// World position [x,y,z] used for wireless-modem distance (e.g. GPS).
+    #[serde(default)]
+    position: Option<[f64; 3]>,
+    /// If set, this node is a TURTLE and gets a fake-world `turtle` API backed
+    /// by this world (sim/engine.lua contract: `blocks` map "x,y,z"->name,
+    /// `start`, `chests`, `unbreakable`). Data-only (no Lua function fields).
+    #[serde(default)]
+    world: Option<serde_json::Value>,
+    /// Wait for this node's `emit()` output before returning (default false).
+    #[serde(default)]
+    collect: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct RunSimArgs {
+    /// The computers/turtles to boot. They share one isolated modem network and
+    /// can talk via rednet/GPS; turtles also get an in-Lua fake world.
+    nodes: Vec<SimNode>,
+    /// Max wall-clock to wait for collected outputs, in ms (default 15000).
+    #[serde(default)]
+    timeout_ms: Option<u64>,
 }
 
 fn rom_path() -> String {
@@ -73,6 +112,42 @@ impl CraftosMcp {
             "{{\"pass\":{pass},\"expected\":\"3,4,5\",\"detail\":\"{}\"}}",
             if pass { "client resolved its position via GPS" } else { "GPS did not resolve" }
         )
+    }
+
+    #[tool(
+        description = "Unified CC simulation runtime: boot an arbitrary set of \
+        networked ComputerCraft computers (and turtles) from a spec, run each \
+        node's Lua program, and return what each node emit()s. Nodes share one \
+        isolated wireless-modem network (NET) so they can use rednet/GPS; a node \
+        with a `world` becomes a turtle with a fake-world turtle API. This is the \
+        general primitive — GPS, rednet protocols, turtle fleets are all just \
+        programs you run on it. Mark the node(s) whose output you want with \
+        collect=true."
+    )]
+    async fn run_simulation(&self, Parameters(args): Parameters<RunSimArgs>) -> String {
+        let spec = serde_json::json!({
+            "timeout_ms": args.timeout_ms.unwrap_or(15000),
+            "nodes": args.nodes.iter().map(|n| serde_json::json!({
+                "label": n.label,
+                "program": n.program,
+                "position": n.position,
+                "world": n.world,
+                "collect": n.collect.unwrap_or(false),
+            })).collect::<Vec<_>>(),
+        })
+        .to_string();
+        tokio::task::spawn_blocking(move || {
+            let c = CString::new(spec).unwrap();
+            unsafe {
+                let p = cc_run(c.as_ptr());
+                if p.is_null() { return "{\"error\":\"runtime returned null\"}".to_string(); }
+                let s = std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned();
+                cc_free(p);
+                s
+            }
+        })
+        .await
+        .unwrap_or_else(|e| format!("{{\"error\":\"join: {e}\"}}"))
     }
 }
 
