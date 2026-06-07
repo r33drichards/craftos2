@@ -36,7 +36,6 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 extern "C" {
-    fn cc_gps_selftest(rom: *const c_char) -> i32;
     fn cc_run(spec_json: *const c_char) -> *mut c_char;
     fn cc_free(p: *mut c_char);
 }
@@ -75,12 +74,6 @@ struct RunSimArgs {
     timeout_ms: Option<u64>,
 }
 
-fn rom_path() -> String {
-    std::env::var("CRAFTOS_ROM").unwrap_or_else(|_| {
-        format!("{}/craftos2-rom", std::env::var("HOME").unwrap_or_default())
-    })
-}
-
 // ── MCP handler (shared by every transport) ──────────────────────────────────
 #[derive(Clone)]
 struct CraftosMcp {
@@ -91,27 +84,6 @@ struct CraftosMcp {
 impl CraftosMcp {
     fn new() -> Self {
         Self { tool_router: Self::tool_router() }
-    }
-
-    #[tool(
-        description = "Run the embedded multi-computer GPS self-test: boot 4 \
-        wireless GPS hosts at known coordinates plus a client, and verify \
-        gps.locate() trilaterates the client's true position (3,4,5). Returns \
-        JSON {pass, expected, detail}."
-    )]
-    async fn gps_selftest(&self) -> String {
-        let rom = rom_path();
-        let result = tokio::task::spawn_blocking(move || {
-            let c = CString::new(rom).unwrap();
-            unsafe { cc_gps_selftest(c.as_ptr()) }
-        })
-        .await
-        .unwrap_or(-1);
-        let pass = result == 1;
-        format!(
-            "{{\"pass\":{pass},\"expected\":\"3,4,5\",\"detail\":\"{}\"}}",
-            if pass { "client resolved its position via GPS" } else { "GPS did not resolve" }
-        )
     }
 
     #[tool(
@@ -156,9 +128,10 @@ impl ServerHandler for CraftosMcp {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
         info.instructions = Some(
-            "Drives an embedded CraftOS-PC emulator to run simulated \
-             multi-computer ComputerCraft tests (rednet, GPS). Call \
-             gps_selftest to verify the GPS simulation end to end."
+            "Drives an embedded CraftOS-PC emulator. Call run_simulation to boot \
+             an arbitrary set of networked ComputerCraft computers and turtles \
+             from a spec (rednet, GPS, turtle programs) and get each node's \
+             emit() output."
                 .into(),
         );
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
