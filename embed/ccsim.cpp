@@ -149,10 +149,16 @@ std::string prelude(int net, bool turtle) {
          "  local f=fs.open('/done','w') f.write('1') f.close()\n"
          "end\n";
     if (turtle)
+        // world.lua (a Lua chunk returning a world table, with generate()/test()
+        // functions if any) takes precedence over the data-only world.json.
         s << "do\n"
              "  local engine=dofile('/engine.lua')\n"
-             "  local h=fs.open('/world.json','r') local wj=h and h.readAll() or '{}' if h then h.close() end\n"
-             "  engine.install(textutils.unserialiseJSON(wj) or {})\n"
+             "  local world\n"
+             "  if fs.exists('/world.lua') then world=dofile('/world.lua')\n"
+             "  elseif fs.exists('/world.json') then\n"
+             "    local h=fs.open('/world.json','r') world=textutils.unserialiseJSON(h.readAll()) h.close()\n"
+             "  end\n"
+             "  engine.install(world or {})\n"
              "end\n";
     return s.str();
 }
@@ -214,16 +220,23 @@ char* cc_run(const char* spec_json) {
             auto a = nd->getArray("position");
             if (a->size() >= 3) { pos.x = a->getElement<double>(0); pos.y = a->getElement<double>(1); pos.z = a->getElement<double>(2); }
         }
-        bool turtle = nd->has("world") && !nd->isNull("world");
+        bool hasWorld = nd->has("world") && !nd->isNull("world");
+        bool hasWorldLua = nd->has("world_lua") && !nd->isNull("world_lua");
+        bool turtle = hasWorld || hasWorldLua;
 
         fs::path d = computerDir / std::to_string(id);
         fs::create_directories(d);
         if (turtle) {
             if (engineSrc.empty()) engineSrc = readFile(enginePath());
             std::ofstream(d / "engine.lua") << engineSrc;
-            std::ostringstream wj;
-            nd->getObject("world")->stringify(wj);
-            std::ofstream(d / "world.json") << wj.str();
+            if (hasWorldLua) {
+                // a Lua chunk that returns the world table (may carry functions)
+                std::ofstream(d / "world.lua") << nd->getValue<std::string>("world_lua");
+            } else {
+                std::ostringstream wj;
+                nd->getObject("world")->stringify(wj);
+                std::ofstream(d / "world.json") << wj.str();
+            }
         }
         spawn(id, pos, prelude(net, turtle) + "\n" + program + "\n");
         recs.push_back({id, label, collect, turtle});

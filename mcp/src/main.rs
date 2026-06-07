@@ -59,6 +59,12 @@ struct SimNode {
     /// `start`, `chests`, `unbreakable`). Data-only (no Lua function fields).
     #[serde(default)]
     world: Option<serde_json::Value>,
+    /// Alternative to `world`: a Lua chunk that `return`s the world table. Use
+    /// this when the world needs functions — e.g. a procedural
+    /// `generate=function(x,y,z) ... end` or a `test=function(sim) ... end`.
+    /// Takes precedence over `world`.
+    #[serde(default)]
+    world_lua: Option<String>,
     /// Wait for this node's `emit()` output before returning (default false).
     #[serde(default)]
     collect: Option<bool>,
@@ -104,6 +110,7 @@ impl CraftosMcp {
                 "program": n.program,
                 "position": n.position,
                 "world": n.world,
+                "world_lua": n.world_lua,
                 "collect": n.collect.unwrap_or(false),
             })).collect::<Vec<_>>(),
         })
