@@ -101,12 +101,12 @@ void ensure_init(const std::string& rom, const std::string& base) {
     });
 }
 
-void spawn(int id, Vec3 p, const std::string& startup) {
+Computer* spawn(int id, Vec3 p, const std::string& startup) {
     { std::lock_guard<std::mutex> lk(g_pos_mutex); g_pos[id] = p; }
     fs::path d = computerDir / std::to_string(id);
     fs::create_directories(d);
     std::ofstream(d / "startup.lua") << startup;
-    startComputer(id);
+    return startComputer(id);
 }
 
 std::string readFile(const fs::path& p) {
@@ -205,7 +205,7 @@ char* cc_run(const char* spec_json) {
     int net = n + 1;        // unique modem network for this run
 
     std::string engineSrc;
-    struct NodeRec { int id; std::string label; bool collect; bool turtle; };
+    struct NodeRec { int id; std::string label; bool collect; bool turtle; Computer* comp; };
     std::vector<NodeRec> recs;
 
     for (size_t i = 0; i < nodes->size(); i++) {
@@ -238,8 +238,8 @@ char* cc_run(const char* spec_json) {
                 std::ofstream(d / "world.json") << wj.str();
             }
         }
-        spawn(id, pos, prelude(net, turtle) + "\n" + program + "\n");
-        recs.push_back({id, label, collect, turtle});
+        Computer* comp = spawn(id, pos, prelude(net, turtle) + "\n" + program + "\n");
+        recs.push_back({id, label, collect, turtle, comp});
     }
 
     // Poll until all collect-nodes have produced output, or timeout.
@@ -268,6 +268,18 @@ char* cc_run(const char* spec_json) {
         waited += 100;
     }
     applyMoves();
+
+    // Tear down every computer this run spawned. Programs like `gps host` loop
+    // forever, so without this each run would leak threads/memory into the
+    // shared emulator and eventually hang it under concurrent use. Setting
+    // running=0 + notifying makes each computer thread exit and queue its own
+    // free (the task pump reclaims it).
+    for (auto& r : recs) {
+        if (r.comp) {
+            r.comp->running = 0;
+            r.comp->event_lock.notify_all();
+        }
+    }
 
     Poco::JSON::Object res;
     res.set("net", net);
