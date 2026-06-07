@@ -64,23 +64,13 @@
           luaExt = if isDarwin then ".dylib" else ".so";
 
           # craftos-mcp only uses SDL2 for SDL_Init(SDL_INIT_TIMER) and linking —
-          # it never opens a window or audio device. Stock pkgs.SDL2 on Linux
-          # drags in its full GUI/audio closure (X11, wayland→libdecor→gtk,
-          # pipewire→gstreamer, pulseaudio, ffmpeg…), which is huge and has twice
-          # filled local disk. Strip those backends on Linux; darwin SDL2 uses
-          # Cocoa frameworks and isn't affected, so leave it untouched there.
-          sdl2 =
-            if pkgs.stdenv.isLinux then
-              pkgs.SDL2.override {
-                x11Support = false;
-                waylandSupport = false;
-                pulseaudioSupport = false;
-                pipewireSupport = false;
-                alsaSupport = false;
-                drmSupport = false;
-                dbusSupport = false;
-              }
-            else pkgs.SDL2;
+          # it never opens a window or audio device, so its GUI/audio backends are
+          # dead weight in the image. We intentionally do NOT override them: on
+          # current nixpkgs `pkgs.SDL2` is `sdl2-compat` (SDL2-on-SDL3), whose
+          # arguments differ from classic SDL2, and the build only runs in CI
+          # (ample disk) — not locally — so closure size is a follow-up, not a
+          # blocker. Slimming would mean overriding the underlying sdl3 backends.
+          sdl2 = pkgs.SDL2;
 
           craftos-mcp = pkgs.stdenv.mkDerivation (finalAttrs: {
             pname = "craftos-mcp";
