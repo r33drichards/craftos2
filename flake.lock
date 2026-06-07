@@ -1,5 +1,39 @@
 {
   "nodes": {
+    "craftos2-lua": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1765602946,
+        "narHash": "sha256-oJ283XO+aIi7RfGFYBl2mMHVaOJ5gXyjwxC5QYEFDmM=",
+        "owner": "MCJack123",
+        "repo": "craftos2-lua",
+        "rev": "d394c303f76103d2251d73b6d5d1ff01877a244f",
+        "type": "github"
+      },
+      "original": {
+        "owner": "MCJack123",
+        "repo": "craftos2-lua",
+        "rev": "d394c303f76103d2251d73b6d5d1ff01877a244f",
+        "type": "github"
+      }
+    },
+    "craftos2-rom": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1776021652,
+        "narHash": "sha256-j+niSQDGp6/2XztKlDFZ4jm5FDkKPaZYid1u00AhOlI=",
+        "owner": "MCJack123",
+        "repo": "craftos2-rom",
+        "rev": "e6f63a1b168a4e37c5b06b090003219085f638cf",
+        "type": "github"
+      },
+      "original": {
+        "owner": "MCJack123",
+        "repo": "craftos2-rom",
+        "rev": "e6f63a1b168a4e37c5b06b090003219085f638cf",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1780243769,
@@ -18,6 +52,8 @@
     },
     "root": {
       "inputs": {
+        "craftos2-lua": "craftos2-lua",
+        "craftos2-rom": "craftos2-rom",
         "nixpkgs": "nixpkgs"
       }
     }
