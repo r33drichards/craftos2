@@ -184,10 +184,19 @@ fn arg(name: &str) -> Option<String> {
 ///   GET /sse + POST /message  legacy HTTP+SSE
 ///   GET /health             liveness for Railway
 fn http_app() -> Router {
+    // rmcp's streamable-HTTP applies DNS-rebinding protection (Host allowlist),
+    // which defaults to localhost only and 403s a public domain. Behind a
+    // platform edge (Railway) we allow any Host; lock it down with
+    // MCP_ALLOWED_HOSTS=host1,host2 if desired.
+    let cfg = match std::env::var("MCP_ALLOWED_HOSTS") {
+        Ok(h) if !h.trim().is_empty() => StreamableHttpServerConfig::default()
+            .with_allowed_hosts(h.split(',').map(|s| s.trim().to_string())),
+        _ => StreamableHttpServerConfig::default().disable_allowed_hosts(),
+    };
     let mcp = StreamableHttpService::new(
         || Ok(CraftosMcp::new()),
         Arc::new(LocalSessionManager::default()),
-        StreamableHttpServerConfig::default(),
+        cfg,
     );
     let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
     Router::new()
