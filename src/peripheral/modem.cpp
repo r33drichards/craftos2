@@ -68,7 +68,7 @@ int modem::transmit(lua_State *L) {
 
 int modem::isWireless(lua_State *L) {
     lastCFunction = __func__;
-    lua_pushboolean(L, false);
+    lua_pushboolean(L, wireless);
     return 1;
 }
 
@@ -171,6 +171,7 @@ void modem::receive(lua_State *data, uint16_t port, uint16_t replyPort, modem * 
 
 modem::modem(lua_State *L, const char * side) {
     if (lua_isnumber(L, 3)) netID = (int)lua_tointeger(L, 3);
+    if (lua_isboolean(L, 4)) wireless = lua_toboolean(L, 4);
     comp = get_comp(L);
     eventQueue = lua_newthread(comp->L);
     eventQueuePosition = lua_gettop(comp->L);

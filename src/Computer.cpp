@@ -211,7 +211,13 @@ extern "C" {
 
 
 static const char * file_reader(lua_State *L, void * ud, size_t *size) {
-    static char file_read_tmp[4096];
+    // Thread-local, not static: multiple computers boot concurrently and each
+    // runs its own lua_load on its own thread. A single shared static buffer
+    // corrupts concurrent bios.lua parses (random syntax errors), and the
+    // resulting load failure then crashes on the NULL headless terminal.
+    // Per-thread storage keeps the returned pointer valid across incremental
+    // reads while isolating threads from each other.
+    static thread_local char file_read_tmp[4096];
     std::ifstream * file = (std::ifstream*)ud;
     if (file->eof()) return NULL;
     file->read(file_read_tmp, 4096);
@@ -698,7 +704,7 @@ void runComputer(Computer * self, const path_t& bios_name, const std::string& bi
             /* the stack */
             fprintf(stderr, "Couldn't load BIOS: %s (%s). Please make sure the CraftOS ROM is installed properly. (See https://www.craftos-pc.cc/docs/error-messages for more information.)\n", bios_path_expanded.string().c_str(), lua_tostring(self->coro, -1));
             if (::config.standardsMode) displayFailure(self->term, "Error loading bios.lua");
-            else queueTask([bios_path_expanded](void* term)->void*{
+            else if (self->term) queueTask([bios_path_expanded](void* term)->void*{
                 ((Terminal*)term)->showMessage(
                     SDL_MESSAGEBOX_ERROR, "Couldn't load BIOS", 
                     std::string(
